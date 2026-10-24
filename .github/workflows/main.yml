@@ -1,0 +1,234 @@
+name: Windows RDP persistente
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rdp-persistente
+  cancel-in-progress: false
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Restaurar archivos guardados
+        shell: pwsh
+        run: |
+          $data = Join-Path $env:GITHUB_WORKSPACE "datos"
+          $homeDir = $env:USERPROFILE
+
+          $folders = @{
+            "Documentos" = "$homeDir\Documents"
+            "Descargas" = "$homeDir\Downloads"
+            "Escritorio" = "$homeDir\Desktop"
+          }
+
+          foreach ($name in $folders.Keys) {
+            $source = Join-Path $data $name
+            $dest = $folders[$name]
+
+            New-Item -ItemType Directory -Path $source -Force | Out-Null
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+
+            Get-ChildItem -LiteralPath $source -Force `
+              -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                  Copy-Item -LiteralPath $_.FullName `
+                    -Destination $dest -Recurse -Force -ErrorAction Stop
+                } catch {
+                  Write-Warning "No se pudo restaurar $($_.FullName): $_"
+                }
+              }
+          }
+
+      - name: Crear usuario y mostrar contraseña
+        shell: pwsh
+        run: |
+          $bytes = New-Object byte[] 32
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+          $password = [Convert]::ToBase64String($bytes) + "aA7!"
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+
+          $user = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+
+          if ($user) {
+            Set-LocalUser -Name "RDP" -Password $secure
+          } else {
+            New-LocalUser -Name "RDP" -Password $secure `
+              -Description "Usuario de escritorio remoto" | Out-Null
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" `
+            -Member "RDP" -ErrorAction SilentlyContinue
+
+          # Evita que la contraseña aparezca accidentalmente en los logs.
+          "::add-mask::$password"
+
+          # Se muestra intencionadamente en el resumen para poder conectarte.
+          @"
+          ## Datos de acceso RDP
+
+          **Usuario:** RDP
+
+          **Contraseña:** $password
+
+          **Puerto:** 3389
+
+          La dirección IP aparecerá cuando Tailscale se conecte.
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          Write-Host "Usuario RDP preparado. Consulta Summary para la contraseña."
+
+      - name: Activar Escritorio remoto
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          Set-ItemProperty `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name UserAuthentication -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-Service TermService -StartupType Automatic
+          Start-Service TermService
+
+      - name: Conectar Tailscale y mostrar IP
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "Falta el secreto TAILSCALE_AUTH_KEY."
+          }
+
+          choco install tailscale -y --no-progress
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+            $found = Get-Command tailscale.exe -ErrorAction SilentlyContinue
+            if ($found) {
+              $ts = $found.Source
+            } else {
+              throw "No se encuentra tailscale.exe."
+            }
+          }
+
+          & $ts up --authkey="$env:TAILSCALE_AUTH_KEY" `
+            --hostname="rdp-$env:GITHUB_RUN_ID"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale no pudo conectarse."
+          }
+
+          $ip = $null
+          for ($i = 0; $i -lt 12; $i++) {
+            $ip = & $ts ip -4 2>$null |
+              Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
+              Select-Object -First 1
+
+            if ($ip) { break }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $ip) {
+            throw "Tailscale se inició, pero no se pudo obtener la IP."
+          }
+
+          @"
+
+          ## Conexión de red
+
+          **IP de Tailscale:** $ip
+
+          **Puerto RDP:** 3389
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          Write-Host "Tailscale conectado. IP: $ip"
+
+      - name: Comprobar RDP
+        shell: pwsh
+        run: |
+          $ready = $false
+
+          for ($i = 0; $i -lt 12; $i++) {
+            if (Test-NetConnection 127.0.0.1 -Port 3389 `
+                -InformationLevel Quiet) {
+              $ready = $true
+              break
+            }
+            Start-Sleep -Seconds 5
+          }
+
+          if (-not $ready) {
+            throw "RDP no responde en el puerto 3389."
+          }
+
+          Write-Host "RDP está escuchando."
+
+      - name: Mantener sesión activa
+        shell: pwsh
+        run: |
+          $end = (Get-Date).AddMinutes(245)
+
+          while ((Get-Date) -lt $end) {
+            Write-Host "RDP activo: $(Get-Date)"
+            Start-Sleep -Seconds 60
+          }
+
+      - name: Guardar archivos en el repositorio
+        if: always()
+        shell: pwsh
+        run: |
+          $data = Join-Path $env:GITHUB_WORKSPACE "datos"
+          $homeDir = $env:USERPROFILE
+
+          $folders = @{
+            "Documentos" = "$homeDir\Documents"
+            "Descargas" = "$homeDir\Downloads"
+            "Escritorio" = "$homeDir\Desktop"
+          }
+
+          foreach ($name in $folders.Keys) {
+            $source = $folders[$name]
+            $dest = Join-Path $data $name
+
+            New-Item -ItemType Directory -Path $dest -Force | Out-Null
+
+            # No borrar primero lo ya guardado: evita perder datos
+            # si una carpeta de Windows no se puede copiar.
+            Get-ChildItem -LiteralPath $source -Force `
+              -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                  Copy-Item -LiteralPath $_.FullName `
+                    -Destination $dest -Recurse -Force -ErrorAction Stop
+                } catch {
+                  Write-Warning "No se pudo guardar $($_.FullName): $_"
+                }
+              }
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -- datos/
+
+          if (-not (git diff --cached --quiet)) {
+            git commit -m "Guardar archivos de la sesión RDP"
+            git push origin "HEAD:$env:GITHUB_REF_NAME"
+          } else {
+            Write-Host "No hay cambios que guardar."
+          }
+
