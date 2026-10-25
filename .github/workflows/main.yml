@@ -264,6 +264,7 @@ jobs:
           Set-Content "C:\last-sig.txt" $sig
           Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
           Write-Host "[backup] Copia guardada en la Release $tag"
+          exit 0
           '@
           Set-Content -Path "C:\backup.ps1" -Value $script -Encoding utf8
 
@@ -567,7 +568,9 @@ jobs:
           function Invoke-Backup {
               Write-Host ("{0:HH:mm:ss} Ejecutando copia de seguridad..." -f (Get-Date))
               & pwsh -NoProfile -ExecutionPolicy Bypass -File "C:\backup.ps1"
-              return $LASTEXITCODE
+              $ec = $LASTEXITCODE
+              if ($null -eq $ec) { $ec = 0 }
+              return $ec
           }
 
           $lastBackup = $start
@@ -632,5 +635,3 @@ jobs:
           } catch {
               "- No se pudo listar las copias." | Out-File $out -Append -Encoding utf8
           }
-
-          $global:LASTEXITCODE = 0
