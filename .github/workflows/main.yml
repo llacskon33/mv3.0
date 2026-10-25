@@ -84,60 +84,18 @@ jobs:
           Write-Host "`n===== 25 CARPETAS MÁS PESADAS (GB) ====="
           $top | Select-Object -First 25 | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
 
-      - name: Free disk space
+      - name: Prepare data folders
         shell: pwsh
         run: |
+          # Marca de tiempo del inicio real: sirve para no pasarse del timeout de 360 min
+          "JOB_START=$((Get-Date).ToString('o'))" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
           function Show-Free {
               Get-PSDrive -Name C,D -ErrorAction SilentlyContinue | ForEach-Object {
                   Write-Host ("{0}: libre {1} GB" -f $_.Name, [math]::Round($_.Free/1GB,1))
               }
           }
           Write-Host "== Antes =="; Show-Free
-
-          $dirs = @(
-            "C:\Android",
-            "C:\Program Files (x86)\Android",
-            "C:\hostedtoolcache\windows",
-            "C:\Julia",
-            "C:\SeleniumWebDrivers",
-            "C:\Users\runneradmin\.cargo",
-            "C:\Users\runneradmin\.rustup",
-            "C:\Program Files\Microsoft Visual Studio",
-            "C:\Program Files (x86)\Microsoft Visual Studio",
-            "C:\ProgramData\Microsoft\VisualStudio",
-            "C:\Program Files\Unity Hub",
-            "C:\rtools45",
-            "C:\Program Files\R",
-            "C:\Program Files (x86)\Windows Kits",
-            "C:\Program Files (x86)\Windows Application Driver",
-            "C:\Program Files (x86)\Microsoft SDKs",
-            "C:\Program Files\Microsoft SDKs",
-            "C:\Program Files\Microsoft SQL Server",
-            "C:\Program Files\MongoDB",
-            "C:\Program Files\mongosh",
-            "C:\Program Files\PostgreSQL",
-            "C:\Program Files\MySQL",
-            "C:\Program Files\Azure Cosmos DB Emulator",
-            "C:\Program Files\OpenSSL",
-            "C:\Program Files\OpenSSL-Win64",
-            "C:\Program Files\Microsoft Service Fabric",
-            "C:\SvcFab",
-            "C:\Program Files (x86)\WiX Toolset v3.14",
-            "C:\Program Files\LLVM",
-            "C:\Strawberry",
-            "C:\Program Files (x86)\sbt",
-            "C:\Program Files (x86)\Inno Setup 6",
-            "C:\Program Files\IIS Express",
-            "C:\Program Files (x86)\IIS Express",
-            "C:\Program Files\Amazon"
-          )
-          $dirs | Where-Object { Test-Path $_ } | ForEach-Object -Parallel {
-              cmd /c rd /s /q "$_" 2>$null
-          } -ThrottleLimit 6
-
-          if (Get-Command docker -ErrorAction SilentlyContinue) {
-              docker system prune -a -f 2>$null | Out-Null
-          }
 
           # C:\Datos vive en D: (más espacio libre) y se accede igual desde C:\Datos
           if (Test-Path "D:\") {
@@ -397,6 +355,8 @@ jobs:
 
           if (-not $rel) {
               Write-Host "No hay copia previa completa (primera ejecución)."
+              # Sin copia previa que restaurar: la sesión puede guardar la primera
+              "ok" | Set-Content "C:\restore-ok.flag"
               "RESTORE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
               $global:LASTEXITCODE = 0
               exit 0
@@ -411,10 +371,266 @@ jobs:
           }
           if (-not $ok) {
               Write-Host "::warning::No se pudo descargar la copia. Esta sesión NO guardará copias para no pisar la anterior."
+              Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue
+              "RESTORE_OK=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
               $global:LASTEXITCODE = 0
               exit 0
           }
 
-          Get-ChildItem $dl -File | ForEach-Object {
-              Write-Host (" {0} {1} MB" -f $_.Name, [math]::Round($_.Length/1MB))
-         
+          Get-ChildItem $dl -File | ForEach-Object { Write-Host (" {0} {1} MB" -f $_.Name, [math]::Round($_.Length/1MB)) }
+
+          # Sembrar el perfil del usuario ANTES de restaurar: así Windows no crea
+          # el perfil desde Default al primer inicio y pisa los archivos restaurados.
+          try {
+              $sec = ConvertTo-SecureString $env:RDP_PASSWORD_GEN -AsPlainText -Force
+              $cred = New-Object System.Management.Automation.PSCredential("RDP", $sec)
+              Start-Process -FilePath "cmd.exe" -ArgumentList "/c exit" -Credential $cred `
+                            -WindowStyle Hidden -Wait
+              Write-Host "Perfil del usuario RDP pre-creado."
+          } catch {
+              Write-Host "::warning::No se pudo pre-crear el perfil (se restaurará igualmente): $($_.Exception.Message)"
+          }
+
+          # 7-Zip guarda solo el último componente de la ruta:
+          #   datos.7z   = "Datos\..."            -> -oD:\   (o -oC:\ si no hay D:)
+          #   profile.7z = "RDP\..."              -> -oC:\Users\
+          #   dextra.7z  = "<carpetaD:\>..."       -> -oD:\
+          $datosRoot = if (Test-Path "D:\") { "D:\" } else { "C:\" }
+          $restoreOk = $true
+
+          $sets = @(
+              @{ Vol = "datos.7z.001";   Out = $datosRoot },
+              @{ Vol = "profile.7z.001"; Out = "C:\Users\" },
+              @{ Vol = "dextra.7z.001";  Out = $datosRoot }
+          )
+          foreach ($s in $sets) {
+              $vol = Join-Path $dl $s.Vol
+              if (-not (Test-Path $vol)) { continue }
+              Write-Host "Extrayendo $($s.Vol) -> $($s.Out)"
+              & $7z x $vol "-o$($s.Out)" -y | Out-Null
+              if ($LASTEXITCODE -ge 2) {
+                  Write-Host "::warning::Error extrayendo $($s.Vol) (código $LASTEXITCODE)"
+                  $restoreOk = $false
+              }
+          }
+
+          $datosDir = if (Test-Path "D:\") { "D:\Datos" } else { "C:\Datos" }
+          if ($restoreOk -and -not (Test-Path $datosDir)) {
+              Write-Host "::warning::No apareció $datosDir tras extraer la copia."
+              $restoreOk = $false
+          }
+
+          # Devolver los programas guardados a su sitio
+          $prog = "C:\Datos\.programas"
+          if ($restoreOk -and (Test-Path $prog)) {
+              foreach ($m in @(
+                  @{ S = "$prog\PF";    D = "C:\Program Files" },
+                  @{ S = "$prog\PF86";  D = "C:\Program Files (x86)" },
+                  @{ S = "$prog\Local"; D = "C:\Users\RDP\AppData\Local\Programs" }
+              )) {
+                  if (Test-Path $m.S) {
+                      Write-Host "Restaurando programas: $($m.S) -> $($m.D)"
+                      robocopy $m.S $m.D /E /COPY:DAT /DCOPY:T /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Null
+                      $global:LASTEXITCODE = 0
+                  }
+              }
+          }
+
+          # Reinstalar paquetes de Chocolatey guardados en la copia
+          $chocoList = "C:\Datos\.apps\choco-packages.txt"
+          if ($restoreOk -and (Test-Path $chocoList)) {
+              $pkgs = @(Get-Content $chocoList -ErrorAction SilentlyContinue | Where-Object { $_.Trim() })
+              foreach ($p in $pkgs) {
+                  Write-Host "choco install $p"
+                  choco install $p -y --no-progress | Out-Null
+                  $global:LASTEXITCODE = 0
+              }
+          }
+
+          if ($restoreOk) {
+              "ok" | Set-Content "C:\restore-ok.flag"
+              "RESTORE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              Write-Host "Restauración completada."
+          } else {
+              "RESTORE_OK=0" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              Write-Host "::warning::Restauración incompleta: esta sesión NO hará copias para no pisar la anterior."
+          }
+
+          Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue
+          $global:LASTEXITCODE = 0
+
+      - name: Set up Tailscale
+        shell: pwsh
+        env:
+          TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+        run: |
+          $ip = ""
+          if (-not $env:TS_AUTHKEY) {
+              Write-Host "::warning::Falta el secreto TS_AUTHKEY: la regla de firewall solo permite 100.64.0.0/10 (Tailscale), así que el puerto 3389 quedará inaccesible."
+          } else {
+              $msi = Join-Path $env:RUNNER_TEMP "tailscale.msi"
+              try {
+                  Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+                                    -OutFile $msi -UseBasicParsing -TimeoutSec 120
+                  $p = Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/qn", "/norestart" -Wait -PassThru
+                  Write-Host "Instalación de Tailscale: exit $($p.ExitCode)"
+              } catch {
+                  Write-Host "::warning::No se pudo instalar Tailscale: $($_.Exception.Message)"
+              }
+
+              $ts = "C:\Program Files\Tailscale\tailscale.exe"
+              for ($i = 0; $i -lt 15 -and -not (Test-Path $ts); $i++) { Start-Sleep 2 }
+
+              if (Test-Path $ts) {
+                  $tsHost = "rdp-$($env:GITHUB_RUN_ID)"
+                  $up = $false
+                  for ($i = 1; $i -le 6 -and -not $up; $i++) {
+                      & $ts up --auth-key="$env:TS_AUTHKEY" --hostname=$tsHost 2>&1 | Write-Host
+                      if ($LASTEXITCODE -eq 0) { $up = $true } else { Start-Sleep 8 }
+                  }
+                  if ($up) {
+                      $ip = ((& $ts ip -4) | Select-Object -First 1)
+                      if ($ip) { $ip = $ip.Trim() }
+                      Write-Host "Tailscale conectado. IP: $ip"
+                  } else {
+                      Write-Host "::warning::'tailscale up' falló: RDP no será alcanzable."
+                  }
+              } else {
+                  Write-Host "::warning::tailscale.exe no encontrado tras la instalación."
+              }
+          }
+
+          "TS_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $global:LASTEXITCODE = 0
+
+      - name: Show connection info
+        if: ${{ always() }}
+        shell: pwsh
+        run: |
+          $out = $env:GITHUB_STEP_SUMMARY
+          $pw = $env:RDP_PASSWORD_GEN
+
+          "## Conexión RDP" | Out-File $out -Append -Encoding utf8
+          if ($env:TS_IP) {
+              "- Host: ``$($env:TS_IP)`` (red de Tailscale; instala Tailscale en tu equipo y únete a la misma red)" |
+                Out-File $out -Append -Encoding utf8
+          } else {
+              "- Host: **no disponible** (falta ``TS_AUTHKEY``; la regla de firewall solo permite Tailscale)" |
+                Out-File $out -Append -Encoding utf8
+          }
+          "- Puerto: ``3389`` (RDP con NLA)" | Out-File $out -Append -Encoding utf8
+          "- Usuario: ``RDP``" | Out-File $out -Append -Encoding utf8
+          "- Contraseña:" | Out-File $out -Append -Encoding utf8
+          if ($pw) {
+              # Valla de 4 comillas: la contraseña puede contener comillas invertidas
+              '````' | Out-File $out -Append -Encoding utf8
+              $pw | Out-File $out -Append -Encoding utf8
+              '````' | Out-File $out -Append -Encoding utf8
+          } else {
+              "(no disponible)" | Out-File $out -Append -Encoding utf8
+          }
+          "- La sesión termina sola al llegar al plazo: conecta cuanto antes." |
+            Out-File $out -Append -Encoding utf8
+
+          Write-Host "Datos de conexión escritos en el resumen del paso."
+
+      - name: RDP session (periodic backups)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MINUTOS: ${{ inputs.minutos }}
+          INTERVALO: ${{ inputs.intervalo }}
+        run: |
+          $start = Get-Date
+
+          $min = 0; [void][int]::TryParse("$env:MINUTOS", [ref]$min)
+          if ($min -lt 1)  { $min = 1 }
+          if ($min -gt 315) { $min = 315 }
+
+          $interval = 0; [void][int]::TryParse("$env:INTERVALO", [ref]$interval)
+          if ($interval -lt 1)  { $interval = 1 }
+          if ($interval -gt 315) { $interval = 315 }
+
+          # Tope duro: dejar margen dentro del timeout de 360 min del job
+          # para que la copia final (comprimir + subir) pueda terminar.
+          $jobStart = $start.AddMinutes(-20)
+          if ($env:JOB_START) {
+              try { $jobStart = [datetime]::Parse($env:JOB_START) } catch { }
+          }
+          $candidate = $start.AddMinutes($min)
+          $limit = $jobStart.AddMinutes(350)
+          $deadline = if ($candidate -lt $limit) { $candidate } else { $limit }
+
+          Write-Host ("Sesión: {0} min o hasta {1:HH:mm:ss} (lo que llegue antes); copia cada {2} min." -f `
+                      $min, $deadline, $interval)
+
+          function Invoke-Backup {
+              Write-Host ("{0:HH:mm:ss} Ejecutando copia de seguridad..." -f (Get-Date))
+              & pwsh -NoProfile -ExecutionPolicy Bypass -File "C:\backup.ps1"
+              return $LASTEXITCODE
+          }
+
+          $lastBackup = $start
+          $parado = $false
+          while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds 60
+              if (Test-Path "C:\Datos\parar.txt") {
+                  Remove-Item "C:\Datos\parar.txt" -Force -ErrorAction SilentlyContinue
+                  Write-Host "parar.txt detectado: se corta la espera."
+                  $parado = $true
+                  break
+              }
+              if (((Get-Date) - $lastBackup).TotalMinutes -ge $interval -and (Get-Date) -lt $deadline) {
+                  $code = Invoke-Backup
+                  $lastBackup = Get-Date
+                  if ($code -ne 0) {
+                      Write-Host "::warning::Copia periódica falló (código $code); se reintenta en el próximo intervalo."
+                  }
+              }
+          }
+          if (-not $parado) { Write-Host "Plazo cumplido." }
+
+          Write-Host "== Copia final =="
+          $code = Invoke-Backup
+          if ($code -ne 0) {
+              Write-Host "::error::La copia final falló (código $code); se conserva la copia anterior."
+              exit 1
+          }
+
+      - name: Final summary
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $out = $env:GITHUB_STEP_SUMMARY
+
+          "## Estado final" | Out-File $out -Append -Encoding utf8
+          $rok = if ($env:RESTORE_OK) { $env:RESTORE_OK } else { "?" }
+          "- Restauración correcta: $rok" | Out-File $out -Append -Encoding utf8
+          $tip = if ($env:TS_IP) { $env:TS_IP } else { "no disponible" }
+          "- IP Tailscale: $tip" | Out-File $out -Append -Encoding utf8
+
+          "`n### Espacio libre" | Out-File $out -Append -Encoding utf8
+          Get-PSDrive -Name C,D -ErrorAction SilentlyContinue | ForEach-Object {
+              "- $($_.Name): $([math]::Round($_.Free/1GB,1)) GB libres" |
+                Out-File $out -Append -Encoding utf8
+          }
+
+          "`n### Copias de seguridad" | Out-File $out -Append -Encoding utf8
+          try {
+              $rels = gh release list --limit 10 --json tagName,createdAt 2>$null | ConvertFrom-Json |
+                      Where-Object { $_.tagName -like "$($env:BACKUP_PREFIX)*" }
+              if ($rels) {
+                  $rels | ForEach-Object {
+                      "- $($_.tagName) ($($_.createdAt))" | Out-File $out -Append -Encoding utf8
+                  }
+              } else {
+                  "- Ninguna copia en esta ejecución (sin cambios o restauración fallida)." |
+                    Out-File $out -Append -Encoding utf8
+              }
+          } catch {
+              "- No se pudo listar las copias." | Out-File $out -Append -Encoding utf8
+          }
+
+          $global:LASTEXITCODE = 0
