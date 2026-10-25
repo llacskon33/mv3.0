@@ -26,7 +26,6 @@ env:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    # Máximo permitido por GitHub en runners hospedados: 360 min (6 h)
     timeout-minutes: 360
 
     steps:
@@ -87,7 +86,6 @@ jobs:
       - name: Prepare data folders
         shell: pwsh
         run: |
-          # Marca de tiempo del inicio real: sirve para no pasarse del timeout de 360 min
           "JOB_START=$((Get-Date).ToString('o'))" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
           function Show-Free {
@@ -97,7 +95,6 @@ jobs:
           }
           Write-Host "== Antes =="; Show-Free
 
-          # C:\Datos vive en D: (más espacio libre) y se accede igual desde C:\Datos
           if (Test-Path "D:\") {
               New-Item -ItemType Directory -Path "D:\Datos" -Force | Out-Null
               if (-not (Test-Path "C:\Datos")) {
@@ -117,13 +114,11 @@ jobs:
           $7z = "C:\Program Files\7-Zip\7z.exe"
           $prefix = $env:BACKUP_PREFIX
 
-          # Protección: si la restauración no terminó bien, no se guarda nada
           if (-not (Test-Path "C:\restore-ok.flag")) {
               Write-Host "[backup] La restauración no terminó bien: no se guarda nada para no pisar la copia anterior."
               exit 0
           }
 
-          # ---- 1) ¿Ha cambiado algo desde la última copia? ----
           $skip = @('Datos','System Volume Information','$RECYCLE.BIN','_rdp_dl','_rdp_backup')
           $roots = @("C:\Datos","C:\Users\RDP")
           if (Test-Path "D:\") {
@@ -146,7 +141,6 @@ jobs:
           }
           Write-Host "[backup] Hay cambios: preparando copia..."
 
-          # ---- 2) Preparar programas y listas ----
           $appsDir = "C:\Datos\.apps"
           $prog = "C:\Datos\.programas"
           New-Item -ItemType Directory -Path $appsDir -Force | Out-Null
@@ -198,7 +192,6 @@ jobs:
                 Set-Content "$appsDir\programas-instalados.txt"
           }
 
-          # ---- 3) Comprimir en trozos de 1.9 GB ----
           $dst = "D:\_rdp_backup"
           if (-not (Test-Path "D:\")) { $dst = "C:\_rdp_backup" }
           Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
@@ -235,7 +228,6 @@ jobs:
           $gb = [math]::Round(((Get-ChildItem $dst -File | Measure-Object Length -Sum).Sum)/1GB,2)
           Write-Host "[backup] Copia lista: $($files.Count) archivos, $gb GB. Subiendo..."
 
-          # ---- 4) Subir: la copia solo vale cuando existe complete.flag ----
           $tag = "$prefix$(Get-Date -Format 'yyyyMMdd-HHmmss')"
           gh release create $tag --title $tag --notes "Copia automática del escritorio remoto" --latest=false
           if ($LASTEXITCODE -ne 0) { Write-Host "[backup] No se pudo crear la Release."; exit 1 }
@@ -256,7 +248,6 @@ jobs:
               exit 1
           }
 
-          # Subida correcta: borrar copias anteriores
           $old = gh release list --limit 100 --json tagName 2>$null | ConvertFrom-Json |
                  Where-Object { $_.tagName -like "$prefix*" -and $_.tagName -ne $tag }
           foreach ($o in $old) { gh release delete $o.tagName --yes --cleanup-tag }
@@ -308,9 +299,9 @@ jobs:
         shell: pwsh
         run: |
           $charSet = @{
-              Upper = [char[]](65..90) # A-Z
-              Lower = [char[]](97..122) # a-z
-              Number = [char[]](48..57) # 0-9
+              Upper = [char[]](65..90)
+              Lower = [char[]](97..122)
+              Number = [char[]](48..57)
               Special = ([char[]](33..47) + [char[]](58..64) +
                          [char[]](91..96) + [char[]](123..126))
           }
@@ -331,7 +322,10 @@ jobs:
               exit 1
           }
 
-          "RDP_PASSWORD_GEN=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $password | Set-Content -Path "C:\rdp-password.txt" -Encoding utf8 -NoNewline
+          "RDP_PASSWORD_GEN<<RDP_PW_EOF" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $password | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PW_EOF" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Download backup and restore D and Datos
         shell: pwsh
@@ -344,7 +338,6 @@ jobs:
           New-Item -ItemType Directory -Path $dl -Force | Out-Null
           "RDP_DL=$dl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          # Última copia COMPLETA (las que se cortaron a mitad se ignoran)
           $cands = gh release list --limit 100 --json tagName,createdAt 2>$null | ConvertFrom-Json |
                    Where-Object { $_.tagName -like "$($env:BACKUP_PREFIX)*" } |
                    Sort-Object createdAt -Descending
@@ -356,7 +349,6 @@ jobs:
 
           if (-not $rel) {
               Write-Host "No hay copia previa completa (primera ejecución)."
-              # Sin copia previa que restaurar: la sesión puede guardar la primera
               "ok" | Set-Content "C:\restore-ok.flag"
               "RESTORE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
               $global:LASTEXITCODE = 0
@@ -380,8 +372,6 @@ jobs:
 
           Get-ChildItem $dl -File | ForEach-Object { Write-Host (" {0} {1} MB" -f $_.Name, [math]::Round($_.Length/1MB)) }
 
-          # Sembrar el perfil del usuario ANTES de restaurar: así Windows no crea
-          # el perfil desde Default al primer inicio y pisa los archivos restaurados.
           try {
               $sec = ConvertTo-SecureString $env:RDP_PASSWORD_GEN -AsPlainText -Force
               $cred = New-Object System.Management.Automation.PSCredential("RDP", $sec)
@@ -392,10 +382,6 @@ jobs:
               Write-Host "::warning::No se pudo pre-crear el perfil (se restaurará igualmente): $($_.Exception.Message)"
           }
 
-          # 7-Zip guarda solo el último componente de la ruta:
-          #   datos.7z   = "Datos\..."            -> -oD:\   (o -oC:\ si no hay D:)
-          #   profile.7z = "RDP\..."              -> -oC:\Users\
-          #   dextra.7z  = "<carpetaD:\>..."       -> -oD:\
           $datosRoot = if (Test-Path "D:\") { "D:\" } else { "C:\" }
           $restoreOk = $true
 
@@ -421,7 +407,6 @@ jobs:
               $restoreOk = $false
           }
 
-          # Devolver los programas guardados a su sitio
           $prog = "C:\Datos\.programas"
           if ($restoreOk -and (Test-Path $prog)) {
               foreach ($m in @(
@@ -437,7 +422,6 @@ jobs:
               }
           }
 
-          # Reinstalar paquetes de Chocolatey guardados en la copia
           $chocoList = "C:\Datos\.apps\choco-packages.txt"
           if ($restoreOk -and (Test-Path $chocoList)) {
               $pkgs = @(Get-Content $chocoList -ErrorAction SilentlyContinue | Where-Object { $_.Trim() })
@@ -510,6 +494,9 @@ jobs:
         run: |
           $out = $env:GITHUB_STEP_SUMMARY
           $pw = $env:RDP_PASSWORD_GEN
+          if (-not $pw -and (Test-Path "C:\rdp-password.txt")) {
+              $pw = (Get-Content "C:\rdp-password.txt" -Raw).Trim()
+          }
 
           "## Conexión RDP" | Out-File $out -Append -Encoding utf8
           if ($env:TS_IP) {
@@ -523,7 +510,6 @@ jobs:
           "- Usuario: ``RDP``" | Out-File $out -Append -Encoding utf8
           "- Contraseña:" | Out-File $out -Append -Encoding utf8
           if ($pw) {
-              # Valla de 4 comillas: la contraseña puede contener comillas invertidas
               '````' | Out-File $out -Append -Encoding utf8
               $pw | Out-File $out -Append -Encoding utf8
               '````' | Out-File $out -Append -Encoding utf8
@@ -552,8 +538,6 @@ jobs:
           if ($interval -lt 1)  { $interval = 1 }
           if ($interval -gt 315) { $interval = 315 }
 
-          # Tope duro: dejar margen dentro del timeout de 360 min del job
-          # para que la copia final (comprimir + subir) pueda terminar.
           $jobStart = $start.AddMinutes(-20)
           if ($env:JOB_START) {
               try { $jobStart = [datetime]::Parse($env:JOB_START) } catch { }
@@ -635,3 +619,5 @@ jobs:
           } catch {
               "- No se pudo listar las copias." | Out-File $out -Append -Encoding utf8
           }
+
+          $global:LASTEXITCODE = 0
