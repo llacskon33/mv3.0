@@ -122,12 +122,12 @@ jobs:
           $skip = @('Datos','System Volume Information','$RECYCLE.BIN','_rdp_dl','_rdp_backup')
           $roots = @("C:\Datos","C:\Users\RDP")
           if (Test-Path "D:\") {
-              $roots += Get-ChildItem "D:\" -Directory -Force -ErrorAction SilentlyContinue |
+              $roots += Get-ChildItem "D:\" -Directory -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
                         Where-Object { $_.Name -notin $skip } | ForEach-Object FullName
           }
           $lines = foreach ($r in $roots) {
               if (Test-Path $r) {
-                  Get-ChildItem $r -Recurse -File -Force -ErrorAction SilentlyContinue |
+                  Get-ChildItem $r -Recurse -File -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
                     Where-Object { $_.FullName -notmatch '\\\.apps\\|\\\.programas\\|\\Temp\\|\\INetCache\\|parar\.txt' } |
                     ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }
               }
@@ -177,7 +177,7 @@ jobs:
 
           if (Test-Path "C:\baseline-choco.txt") {
               $base = @(Get-Content "C:\baseline-choco.txt")
-              $now = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue | ForEach-Object Name
+              $now = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | ForEach-Object Name
               @($now | Where-Object { $_ -notin $base }) | Sort-Object | Set-Content "$appsDir\choco-packages.txt"
           }
           if (Test-Path "C:\baseline-registry.txt") {
@@ -210,7 +210,7 @@ jobs:
           }
 
           if (Test-Path "D:\") {
-              $extra = Get-ChildItem "D:\" -Directory -Force -ErrorAction SilentlyContinue |
+              $extra = Get-ChildItem "D:\" -Directory -Force -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
                        Where-Object { $_.Name -notin $skip } | ForEach-Object FullName
               if ($extra) {
                   & $7z a -t7z -mx=1 -v1900m -ssw "$dst\dextra.7z" @extra | Out-Null
@@ -262,7 +262,7 @@ jobs:
       - name: Record baseline (apps del runner)
         shell: pwsh
         run: |
-          Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue |
+          Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue -WarningAction SilentlyContinue |
             ForEach-Object Name | Sort-Object |
             Set-Content "C:\baseline-choco.txt"
 
@@ -323,9 +323,18 @@ jobs:
           }
 
           $password | Set-Content -Path "C:\rdp-password.txt" -Encoding utf8 -NoNewline
-          "RDP_PASSWORD_GEN<<RDP_PW_EOF" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          $out = $env:GITHUB_STEP_SUMMARY
+          "## Conexión RDP (generada en este paso)" | Out-File $out -Append -Encoding utf8
+          "- Usuario: ``RDP``" | Out-File $out -Append -Encoding utf8
+          "- Contraseña:" | Out-File $out -Append -Encoding utf8
+          '````' | Out-File $out -Append -Encoding utf8
+          $password | Out-File $out -Append -Encoding utf8
+          '````' | Out-File $out -Append -Encoding utf8
+
+          "RDP_PASSWORD_GEN<<RDP_PASSWORD_EOF_7f3a9b2c" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $password | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "RDP_PW_EOF" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RDP_PASSWORD_EOF_7f3a9b2c" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Download backup and restore D and Datos
         shell: pwsh
@@ -497,6 +506,7 @@ jobs:
           if (-not $pw -and (Test-Path "C:\rdp-password.txt")) {
               $pw = (Get-Content "C:\rdp-password.txt" -Raw).Trim()
           }
+          Write-Host "DEBUG: contraseña disponible = $([bool]$pw); longitud = $($pw.Length)"
 
           "## Conexión RDP" | Out-File $out -Append -Encoding utf8
           if ($env:TS_IP) {
