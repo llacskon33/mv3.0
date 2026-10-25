@@ -14,22 +14,14 @@ on:
       intervalo:
         description: "Cada cuántos minutos hacer copia de seguridad"
         type: number
-        default: 60
+        default: 30
 
 permissions:
   contents: write
 
-# Evita dos sesiones a la vez (se pisarían las copias)
-concurrency:
-  group: rdp-session
-  cancel-in-progress: false
-
 env:
-  # Las copias se guardan en ramas con este prefijo, en carpetas data1, data2...
   BACKUP_PREFIX: rdp-backup-
-  # Tamaño máximo de una copia (GB). GitHub recomienda repos de menos de 5 GB
-  MAX_BACKUP_GB: 4
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   secure-rdp:
@@ -38,12 +30,6 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Record start time
-        shell: pwsh
-        run: |
-          "JOB_START=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" |
-            Out-File $env:GITHUB_ENV -Append -Encoding utf8
-
       - name: List installed apps
         if: ${{ inputs.inventario }}
         shell: pwsh
@@ -98,9 +84,61 @@ jobs:
           Write-Host "`n===== 25 CARPETAS MÁS PESADAS (GB) ====="
           $top | Select-Object -First 25 | Format-Table -AutoSize | Out-String -Width 250 | Write-Host
 
-      - name: Prepare data folder
+      - name: Free disk space
         shell: pwsh
         run: |
+          function Show-Free {
+              Get-PSDrive -Name C,D -ErrorAction SilentlyContinue | ForEach-Object {
+                  Write-Host ("{0}: libre {1} GB" -f $_.Name, [math]::Round($_.Free/1GB,1))
+              }
+          }
+          Write-Host "== Antes =="; Show-Free
+
+          $dirs = @(
+            "C:\Android",
+            "C:\Program Files (x86)\Android",
+            "C:\hostedtoolcache\windows",
+            "C:\Julia",
+            "C:\SeleniumWebDrivers",
+            "C:\Users\runneradmin\.cargo",
+            "C:\Users\runneradmin\.rustup",
+            "C:\Program Files\Microsoft Visual Studio",
+            "C:\Program Files (x86)\Microsoft Visual Studio",
+            "C:\ProgramData\Microsoft\VisualStudio",
+            "C:\Program Files\Unity Hub",
+            "C:\rtools45",
+            "C:\Program Files\R",
+            "C:\Program Files (x86)\Windows Kits",
+            "C:\Program Files (x86)\Windows Application Driver",
+            "C:\Program Files (x86)\Microsoft SDKs",
+            "C:\Program Files\Microsoft SDKs",
+            "C:\Program Files\Microsoft SQL Server",
+            "C:\Program Files\MongoDB",
+            "C:\Program Files\mongosh",
+            "C:\Program Files\PostgreSQL",
+            "C:\Program Files\MySQL",
+            "C:\Program Files\Azure Cosmos DB Emulator",
+            "C:\Program Files\OpenSSL",
+            "C:\Program Files\OpenSSL-Win64",
+            "C:\Program Files\Microsoft Service Fabric",
+            "C:\SvcFab",
+            "C:\Program Files (x86)\WiX Toolset v3.14",
+            "C:\Program Files\LLVM",
+            "C:\Strawberry",
+            "C:\Program Files (x86)\sbt",
+            "C:\Program Files (x86)\Inno Setup 6",
+            "C:\Program Files\IIS Express",
+            "C:\Program Files (x86)\IIS Express",
+            "C:\Program Files\Amazon"
+          )
+          $dirs | Where-Object { Test-Path $_ } | ForEach-Object -Parallel {
+              cmd /c rd /s /q "$_" 2>$null
+          } -ThrottleLimit 6
+
+          if (Get-Command docker -ErrorAction SilentlyContinue) {
+              docker system prune -a -f 2>$null | Out-Null
+          }
+
           # C:\Datos vive en D: (más espacio libre) y se accede igual desde C:\Datos
           if (Test-Path "D:\") {
               New-Item -ItemType Directory -Path "D:\Datos" -Force | Out-Null
@@ -109,6 +147,8 @@ jobs:
               }
           }
           New-Item -ItemType Directory -Path "C:\Datos" -Force | Out-Null
+
+          Write-Host "== Después =="; Show-Free
           $global:LASTEXITCODE = 0
 
       - name: Create backup script
@@ -118,9 +158,6 @@ jobs:
           $ErrorActionPreference = "Continue"
           $7z = "C:\Program Files\7-Zip\7z.exe"
           $prefix = $env:BACKUP_PREFIX
-          $url = "https://x-access-token:$($env:GH_TOKEN)@github.com/$($env:GITHUB_REPOSITORY).git"
-          $maxGB = 4
-          try { if ($env:MAX_BACKUP_GB) { $maxGB = [double]$env:MAX_BACKUP_GB } } catch {}
 
           # Protección: si la restauración no terminó bien, no se guarda nada
           if (-not (Test-Path "C:\restore-ok.flag")) {
@@ -129,18 +166,16 @@ jobs:
           }
 
           # ---- 1) ¿Ha cambiado algo desde la última copia? ----
-          $skip = @('Datos','System Volume Information','$RECYCLE.BIN','_rdp_dl','_rdp_backup','_rdp_git')
+          $skip = @('Datos','System Volume Information','$RECYCLE.BIN','_rdp_dl','_rdp_backup')
           $roots = @("C:\Datos","C:\Users\RDP")
           if (Test-Path "D:\") {
               $roots += Get-ChildItem "D:\" -Directory -Force -ErrorAction SilentlyContinue |
                         Where-Object { $_.Name -notin $skip } | ForEach-Object FullName
           }
-          # Se ignoran ficheros que cambian solos (registro del usuario, temporales, parar.txt)
-          $ignore = '\\\.apps\\|\\\.programas\\|\\Temp\\|\\INetCache\\|parar\.txt|ntuser|usrclass'
           $lines = foreach ($r in $roots) {
               if (Test-Path $r) {
                   Get-ChildItem $r -Recurse -File -Force -ErrorAction SilentlyContinue |
-                    Where-Object { $_.FullName -notmatch $ignore } |
+                    Where-Object { $_.FullName -notmatch '\\\.apps\\|\\\.programas\\|\\Temp\\|\\INetCache\\|parar\.txt' } |
                     ForEach-Object { "$($_.FullName)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }
               }
           }
@@ -158,6 +193,7 @@ jobs:
           $prog = "C:\Datos\.programas"
           New-Item -ItemType Directory -Path $appsDir -Force | Out-Null
           New-Item -ItemType Directory -Path $prog -Force | Out-Null
+          Remove-Item "C:\Datos\parar.txt" -Force -ErrorAction SilentlyContinue
           $cap = 3GB
 
           function Copy-Capped($src, $dst) {
@@ -176,7 +212,7 @@ jobs:
                 ForEach-Object { Copy-Capped $_.FullName (Join-Path $dstRoot $_.Name) }
           }
 
-          Save-New "C:\Program Files"       "C:\baseline-pf.txt"   "$prog\PF"
+          Save-New "C:\Program Files" "C:\baseline-pf.txt" "$prog\PF"
           Save-New "C:\Program Files (x86)" "C:\baseline-pf86.txt" "$prog\PF86"
 
           $lp = "C:\Users\RDP\AppData\Local\Programs"
@@ -189,7 +225,7 @@ jobs:
 
           if (Test-Path "C:\baseline-choco.txt") {
               $base = @(Get-Content "C:\baseline-choco.txt")
-              $now  = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue | ForEach-Object Name
+              $now = Get-ChildItem "C:\ProgramData\chocolatey\lib" -Directory -ErrorAction SilentlyContinue | ForEach-Object Name
               @($now | Where-Object { $_ -notin $base }) | Sort-Object | Set-Content "$appsDir\choco-packages.txt"
           }
           if (Test-Path "C:\baseline-registry.txt") {
@@ -204,9 +240,7 @@ jobs:
                 Set-Content "$appsDir\programas-instalados.txt"
           }
 
-          # ---- 3) Comprimir en trozos de 90 MB (GitHub rechaza archivos de 100 MB o más) ----
-          # Se comprime con rutas relativas para que la restauración sea predecible:
-          #   datos.7z -> Datos\...   profile.7z -> RDP\...   dextra.7z -> <carpetas de D:>
+          # ---- 3) Comprimir en trozos de 1.9 GB ----
           $dst = "D:\_rdp_backup"
           if (-not (Test-Path "D:\")) { $dst = "C:\_rdp_backup" }
           Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
@@ -214,32 +248,22 @@ jobs:
           $datosPath = if (Test-Path "D:\Datos") { "D:\Datos" } else { "C:\Datos" }
           $bad = $false
 
-          Push-Location (Split-Path $datosPath -Parent)
-          & $7z a -t7z -mx=1 -v90m -ssw "$dst\datos.7z" "Datos" "-xr!parar.txt" | Out-Null
+          & $7z a -t7z -mx=1 -v1900m -ssw "$dst\datos.7z" $datosPath | Out-Null
           if ($LASTEXITCODE -ge 2) { $bad = $true }
-          Pop-Location
 
           if (Test-Path "C:\Users\RDP") {
-              Push-Location "C:\Users"
-              & $7z a -t7z -mx=1 -v90m -ssw "$dst\profile.7z" "RDP" `
-                  "-xr!NTUSER.DAT*" "-xr!UsrClass.dat*" `
-                  "-x!RDP\AppData\Local\Temp" `
-                  "-x!RDP\AppData\Local\Microsoft\Windows\INetCache" `
-                  "-x!RDP\AppData\Local\Programs" `
-                  "-x!RDP\Downloads" "-x!RDP\Documents" "-x!RDP\Desktop" `
-                  "-x!RDP\Pictures" "-x!RDP\Videos" "-x!RDP\Music" | Out-Null
+              & $7z a -t7z -mx=1 -v1900m -ssw "$dst\profile.7z" "C:\Users\RDP" `
+                  "-xr!NTUSER.DAT*" "-xr!UsrClass.dat*" "-xr!Temp" "-xr!INetCache" `
+                  "-x!RDP\AppData\Local\Programs" | Out-Null
               if ($LASTEXITCODE -ge 2) { $bad = $true }
-              Pop-Location
           }
 
           if (Test-Path "D:\") {
-              $extra = @(Get-ChildItem "D:\" -Directory -Force -ErrorAction SilentlyContinue |
-                         Where-Object { $_.Name -notin $skip } | ForEach-Object Name)
-              if ($extra.Count -gt 0) {
-                  Push-Location "D:\"
-                  & $7z a -t7z -mx=1 -v90m -ssw "$dst\dextra.7z" @extra | Out-Null
+              $extra = Get-ChildItem "D:\" -Directory -Force -ErrorAction SilentlyContinue |
+                       Where-Object { $_.Name -notin $skip } | ForEach-Object FullName
+              if ($extra) {
+                  & $7z a -t7z -mx=1 -v1900m -ssw "$dst\dextra.7z" @extra | Out-Null
                   if ($LASTEXITCODE -ge 2) { $bad = $true }
-                  Pop-Location
               }
           }
           if ($bad) {
@@ -248,89 +272,40 @@ jobs:
               exit 1
           }
 
-          $files = @(Get-ChildItem $dst -File | Sort-Object Name)
+          $files = Get-ChildItem $dst -File | ForEach-Object FullName
           if (-not $files) { Write-Host "[backup] Nada que guardar."; exit 0 }
-          $gb = [math]::Round((($files | Measure-Object Length -Sum).Sum)/1GB,2)
-          Write-Host "[backup] Copia lista: $($files.Count) archivos, $gb GB."
-          if ($gb -gt $maxGB) {
-              Write-Host "::warning::La copia pesa $gb GB y el máximo es $maxGB GB. No se sube; se conserva la anterior. Borra cosas pesadas de C:\Datos o del perfil."
+          $gb = [math]::Round(((Get-ChildItem $dst -File | Measure-Object Length -Sum).Sum)/1GB,2)
+          Write-Host "[backup] Copia lista: $($files.Count) archivos, $gb GB. Subiendo..."
+
+          # ---- 4) Subir: la copia solo vale cuando existe complete.flag ----
+          $tag = "$prefix$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+          gh release create $tag --title $tag --notes "Copia automática del escritorio remoto" --latest=false
+          if ($LASTEXITCODE -ne 0) { Write-Host "[backup] No se pudo crear la Release."; exit 1 }
+
+          gh release upload $tag @files --clobber
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "[backup] La subida falló: se conserva la copia anterior."
+              gh release delete $tag --yes --cleanup-tag
               Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
               exit 1
           }
 
-          # ---- 4) Subir al repositorio: ramas con carpetas data1, data2... (10 archivos = ~900 MB cada una) ----
-          $ts    = Get-Date -Format 'yyyyMMdd-HHmmss'
-          $wip   = "rdp-wip-$ts"
-          $final = "$prefix$ts"
-          $work  = "D:\_rdp_git"
-          if (-not (Test-Path "D:\")) { $work = "C:\_rdp_git" }
-          Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $work -Force | Out-Null
-          Set-Location $work
-
-          git init -q
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config core.compression 0
-          git config pack.window 0
-          git config http.postBuffer 524288000
-          git config http.lowSpeedLimit 0
-          git checkout -q -b $wip
-
-          function Push-Retry($refspec) {
-              for ($t = 1; $t -le 3; $t++) {
-                  git push -q $url $refspec 2>&1 | Out-Null
-                  if ($LASTEXITCODE -eq 0) { return $true }
-                  Write-Host "[backup] Push fallido (intento $t)"
-                  Start-Sleep 15
-              }
-              return $false
-          }
-
-          $n = 0; $i = 0; $failed = $false
-          while ($i -lt $files.Count) {
-              $n++
-              $folder = Join-Path $work "data$n"
-              New-Item -ItemType Directory -Path $folder -Force | Out-Null
-              $last = [math]::Min($i + 9, $files.Count - 1)
-              $files[$i..$last] | Move-Item -Destination $folder -Force
-              git add -A
-              git commit -q -m "data$n"
-              Write-Host "[backup] Subiendo data$n ..."
-              if (-not (Push-Retry "HEAD:refs/heads/$wip")) { $failed = $true; break }
-              $i += 10
-          }
-
-          if ($failed) {
-              Write-Host "[backup] La subida falló: se conserva la copia anterior."
-              git push -q $url --delete $wip 2>&1 | Out-Null
-              Set-Location C:\
-              Remove-Item $work, $dst -Recurse -Force -ErrorAction SilentlyContinue
+          "ok" | Set-Content "$dst\complete.flag"
+          gh release upload $tag "$dst\complete.flag"
+          if ($LASTEXITCODE -ne 0) {
+              gh release delete $tag --yes --cleanup-tag
+              Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
               exit 1
           }
 
-          # Copia completa: se publica con su nombre definitivo
-          if (-not (Push-Retry "HEAD:refs/heads/$final")) {
-              Write-Host "[backup] No se pudo publicar la copia: se conserva la anterior."
-              git push -q $url --delete $wip 2>&1 | Out-Null
-              Set-Location C:\
-              Remove-Item $work, $dst -Recurse -Force -ErrorAction SilentlyContinue
-              exit 1
-          }
-
-          # Borrar la rama temporal y las copias anteriores
-          $refs = git ls-remote --heads $url 2>$null
-          foreach ($line in $refs) {
-              $name = (($line -split "`t")[1]) -replace '^refs/heads/',''
-              if (($name -like "$prefix*" -and $name -ne $final) -or $name -like 'rdp-wip-*') {
-                  git push -q $url --delete $name 2>&1 | Out-Null
-              }
-          }
+          # Subida correcta: borrar copias anteriores
+          $old = gh release list --limit 100 --json tagName 2>$null | ConvertFrom-Json |
+                 Where-Object { $_.tagName -like "$prefix*" -and $_.tagName -ne $tag }
+          foreach ($o in $old) { gh release delete $o.tagName --yes --cleanup-tag }
 
           Set-Content "C:\last-sig.txt" $sig
-          Set-Location C:\
-          Remove-Item $work, $dst -Recurse -Force -ErrorAction SilentlyContinue
-          Write-Host "[backup] Copia guardada en la rama $final ($n carpetas data)"
+          Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "[backup] Copia guardada en la Release $tag"
           '@
           Set-Content -Path "C:\backup.ps1" -Value $script -Encoding utf8
 
@@ -364,259 +339,82 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                            -Name "SecurityLayer" -Value 2 -Force
 
-          # Solo se permite RDP desde la red de Tailscale (100.64.0.0/10)
-          Disable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
           netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
 
           Restart-Service -Name TermService -Force
-          $global:LASTEXITCODE = 0
 
       - name: Create RDP User
         shell: pwsh
-        env:
-          # Opcional: si defines el secret RDP_PASSWORD se usa esa contraseña;
-          # si no, se genera una aleatoria y se muestra en "Connection info"
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $password = $env:RDP_PASSWORD
-          if (-not $password) {
-              $charSet = @{
-                  Upper   = [char[]](65..90)
-                  Lower   = [char[]](97..122)
-                  Number  = [char[]](48..57)
-                  Special = [char[]]'!@#$%^&*-_=+'
-              }
-              $rawPassword = @()
-              $rawPassword += $charSet.Upper   | Get-Random -Count 4
-              $rawPassword += $charSet.Lower   | Get-Random -Count 4
-              $rawPassword += $charSet.Number  | Get-Random -Count 4
-              $rawPassword += $charSet.Special | Get-Random -Count 4
-              $password = -join ($rawPassword | Sort-Object { Get-Random })
-              "RDP_PASSWORD_GENERATED=$password" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $charSet = @{
+              Upper = [char[]](65..90) # A-Z
+              Lower = [char[]](97..122) # a-z
+              Number = [char[]](48..57) # 0-9
+              Special = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126))
           }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
 
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-              Set-LocalUser -Name "RDP" -Password $securePass
-          } else {
-              New-LocalUser -Name "RDP" -Password $securePass `
-                            -AccountNeverExpires -PasswordNeverExpires | Out-Null
-          }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
 
-      - name: Create user profile
-        shell: pwsh
-        run: |
-          Add-Type -TypeDefinition @'
-          using System;
-          using System.Text;
-          using System.Runtime.InteropServices;
-          public class UserProf {
-              [DllImport("userenv.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-              public static extern int CreateProfile(string sid, string user, StringBuilder path, uint size);
-          }
-          '@
-          $sid = (Get-LocalUser -Name "RDP").SID.Value
-          $sb = New-Object System.Text.StringBuilder 260
-          $hr = [UserProf]::CreateProfile($sid, "RDP", $sb, 260)
-          Write-Host ("CreateProfile HRESULT: 0x{0:X8}" -f $hr)
-          if (-not (Test-Path "C:\Users\RDP")) { throw "No se pudo crear el perfil C:\Users\RDP" }
-
-      - name: Restore last backup
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-          $7z = "C:\Program Files\7-Zip\7z.exe"
-          $prefix = $env:BACKUP_PREFIX
-          $url = "https://x-access-token:$($env:GH_TOKEN)@github.com/$($env:GITHUB_REPOSITORY).git"
-          $hasD = Test-Path "D:\"
-          $root = if ($hasD) { "D:\" } else { "C:\" }
-          $work = Join-Path $root "_rdp_dl"
-          Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path $work -Force | Out-Null
-
-          # 1) Buscar la copia más reciente (si no se puede consultar, NO se activan las copias)
-          $ok = $false
-          for ($t = 1; $t -le 3 -and -not $ok; $t++) {
-              $refs = git ls-remote --heads $url "refs/heads/$prefix*" 2>$null
-              if ($LASTEXITCODE -eq 0) { $ok = $true } else { Start-Sleep 10 }
-          }
-          if (-not $ok) {
-              Write-Host "::warning::No se pudo consultar el repositorio. La sesión sigue, pero no se guardarán copias."
-              exit 0
-          }
-          $names = @($refs | ForEach-Object { (($_ -split "`t")[1]) -replace '^refs/heads/','' } |
-                     Where-Object { $_ } | Sort-Object -Descending)
-          if ($names.Count -eq 0) {
-              Write-Host "No hay copia previa: arranque limpio."
-              Set-Content "C:\restore-ok.flag" "ok"
-              exit 0
-          }
-          $latest = $names[0]
-          Write-Host "Restaurando desde la rama $latest"
-
-          # 2) Descargar
-          $repo = Join-Path $work "repo"
-          $cloned = $false
-          for ($t = 1; $t -le 3 -and -not $cloned; $t++) {
-              git clone -q --depth 1 --branch $latest $url $repo 2>&1 | Out-Null
-              if ($LASTEXITCODE -eq 0) { $cloned = $true }
-              else { Remove-Item $repo -Recurse -Force -ErrorAction SilentlyContinue; Start-Sleep 15 }
-          }
-          if (-not $cloned) {
-              Write-Host "::warning::No se pudo descargar la copia. La sesión sigue, pero no se guardarán copias."
-              Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
-              exit 0
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              Write-Error "User creation failed"
+              exit 1
           }
 
-          # Juntar todos los trozos (data1, data2...) en una sola carpeta
-          $parts = Join-Path $work "parts"
-          New-Item -ItemType Directory -Path $parts -Force | Out-Null
-          Get-ChildItem $repo -Directory -Filter "data*" | ForEach-Object {
-              Get-ChildItem $_.FullName -File | Move-Item -Destination $parts -Force
-          }
-          Remove-Item $repo -Recurse -Force -ErrorAction SilentlyContinue
+          "RDP_PASSWORD_GEN=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          $bad = $false
-          function Expand-Part($name, $dest) {
-              $first = Join-Path $parts "$name.7z.001"
-              if (-not (Test-Path $first)) { return }
-              & $7z x -y -aoa "-o$dest" $first | Out-Null
-              if ($LASTEXITCODE -ge 2) {
-                  $script:bad = $true
-                  Write-Host "::warning::Error al extraer $name"
-              }
-          }
-
-          # 3) Datos y carpetas extra de D:
-          Expand-Part "datos" $root
-          if ($hasD) { Expand-Part "dextra" "D:\" }
-
-          # 4) Perfil (ya creado en el paso anterior): se copian los ficheros encima
-          Expand-Part "profile" "C:\Users"
-
-          # 5) Programas instalados a mano
-          $prog = "C:\Datos\.programas"
-          $appsDir = "C:\Datos\.apps"
-          if (Test-Path "$prog\PF")    { robocopy "$prog\PF"    "C:\Program Files"        /E /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null }
-          if (Test-Path "$prog\PF86")  { robocopy "$prog\PF86"  "C:\Program Files (x86)"  /E /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null }
-          if (Test-Path "$prog\Local") { robocopy "$prog\Local" "C:\Users\RDP\AppData\Local\Programs" /E /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null }
-          $global:LASTEXITCODE = 0
-
-          # 6) Paquetes de Chocolatey
-          $choco = "$appsDir\choco-packages.txt"
-          if ((Test-Path $choco) -and (Get-Command choco -ErrorAction SilentlyContinue)) {
-              foreach ($p in @(Get-Content $choco | Where-Object { $_ })) {
-                  Write-Host "choco install $p"
-                  choco install $p -y --no-progress --limit-output | Out-Host
-              }
-          }
-          $global:LASTEXITCODE = 0
-
-          Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
-          if ($bad) {
-              Write-Host "::warning::La restauración tuvo errores: no se guardarán copias en esta sesión para no pisar la anterior."
-              exit 0
-          }
-          Set-Content "C:\restore-ok.flag" "ok"
-          Write-Host "Restauración completada desde $latest"
-
-      - name: Redirect user folders to D
-        shell: pwsh
-        run: |
-          # Descargas, Documentos, Escritorio... se guardan en D: mediante enlaces (junctions)
-          $base = if (Test-Path "D:\") { "D:\Datos\Usuario" } else { "C:\Datos\Usuario" }
-          $map = [ordered]@{
-              Downloads = "Descargas"; Documents = "Documentos"; Desktop = "Escritorio"
-              Pictures = "Imagenes"; Videos = "Videos"; Music = "Musica"
-          }
-          foreach ($k in $map.Keys) {
-              $target = Join-Path $base $map[$k]
-              $link = "C:\Users\RDP\$k"
-              New-Item -ItemType Directory -Path $target -Force | Out-Null
-              $item = Get-Item $link -Force -ErrorAction SilentlyContinue
-              if ($item -and -not $item.LinkType) {
-                  robocopy $link $target /E /MOVE /R:0 /W:0 /NFL /NDL /NJH /NJS | Out-Null
-                  Remove-Item $link -Recurse -Force -ErrorAction SilentlyContinue
-              }
-              if (-not (Test-Path $link)) { cmd /c mklink /J "$link" "$target" | Out-Null }
-          }
-          $global:LASTEXITCODE = 0
-
-      - name: Connect Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          # Cliente OAuth con permiso "auth_keys" y la etiqueta tag:ci definida en tu ACL (tagOwners).
-          # Alternativa (obsoleta): authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
-          tags: tag:ci
-          hostname: github-rdp
-
-      - name: Connection info
-        shell: pwsh
-        run: |
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          if (-not (Test-Path $ts)) {
-              $c = Get-Command tailscale -ErrorAction SilentlyContinue
-              if ($c) { $ts = $c.Source }
-          }
-          $ip = & $ts ip -4 2>$null | Select-Object -First 1
-
-          $out = $env:GITHUB_STEP_SUMMARY
-          "## Conexión RDP" | Out-File $out -Append -Encoding utf8
-          "- Dirección: ``$ip`` (o el nombre ``github-rdp`` en tu tailnet)" | Out-File $out -Append -Encoding utf8
-          "- Usuario: ``RDP``" | Out-File $out -Append -Encoding utf8
-          if ($env:RDP_PASSWORD_GENERATED) {
-              "- Contraseña: ``$($env:RDP_PASSWORD_GENERATED)``" | Out-File $out -Append -Encoding utf8
-          } else {
-              "- Contraseña: la del secret RDP_PASSWORD" | Out-File $out -Append -Encoding utf8
-          }
-          "- Para terminar antes: crea el fichero ``C:\Datos\parar.txt``" | Out-File $out -Append -Encoding utf8
-
-          Write-Host "Dirección: $ip   Usuario: RDP"
-          if ($env:RDP_PASSWORD_GENERATED) { Write-Host "Contraseña: $($env:RDP_PASSWORD_GENERATED)" }
-          $global:LASTEXITCODE = 0
-
-      - name: Keep session alive (copias periódicas)
+      - name: Download backup and restore D and Datos
         shell: pwsh
         env:
-          MINUTOS: ${{ inputs.minutos || 315 }}
-          INTERVALO: ${{ inputs.intervalo || 60 }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # El tiempo se cuenta desde el inicio del job, así queda margen para la copia final
-          $min = [math]::Min([double]$env:MINUTOS, 315)
-          $int = [math]::Max([double]$env:INTERVALO, 5)
-          $start = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START)
-          $deadline = $start.AddMinutes($min)
-          $nextBackup = [DateTimeOffset]::UtcNow.AddMinutes($int)
-          Write-Host "Sesión activa hasta las $($deadline.ToString('HH:mm')) UTC. Copia cada $int min."
+          $7z = "C:\Program Files\7-Zip\7z.exe"
+          $dl = "D:\_rdp_dl"
+          if (-not (Test-Path "D:\")) { $dl = "C:\_rdp_dl" }
+          New-Item -ItemType Directory -Path $dl -Force | Out-Null
+          "RDP_DL=$dl" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          while ([DateTimeOffset]::UtcNow -lt $deadline) {
-              if (Test-Path "C:\Datos\parar.txt") {
-                  Write-Host "parar.txt detectado: terminando la sesión."
-                  break
-              }
-              $now = [DateTimeOffset]::UtcNow
-              # No se lanza una copia periódica si la final está a punto de empezar
-              if (($now -ge $nextBackup) -and (($deadline - $now).TotalMinutes -gt 10)) {
-                  pwsh -NoProfile -File C:\backup.ps1
-                  $nextBackup = [DateTimeOffset]::UtcNow.AddMinutes($int)
-              }
-              Start-Sleep -Seconds 20
+          # Última copia COMPLETA (las que se cortaron a mitad se ignoran)
+          $cands = gh release list --limit 100 --json tagName,createdAt 2>$null | ConvertFrom-Json |
+                   Where-Object { $_.tagName -like "$($env:BACKUP_PREFIX)*" } |
+                   Sort-Object createdAt -Descending
+          $rel = $null
+          foreach ($c in $cands) {
+              $v = gh release view $c.tagName --json assets 2>$null | ConvertFrom-Json
+              if ($v.assets.name -contains "complete.flag") { $rel = $c; break }
           }
-          $global:LASTEXITCODE = 0
 
-      - name: Final backup
-        if: always()
-        shell: pwsh
-        run: |
-          if (-not (Test-Path "C:\backup.ps1")) {
-              Write-Host "No hay script de copia (el job falló antes de crearlo)."
+          if (-not $rel) {
+              Write-Host "No hay copia previa completa (primera ejecución)."
+              "RESTORE_OK=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              $global:LASTEXITCODE = 0
               exit 0
           }
-          pwsh -NoProfile -File C:\backup.ps1
-          exit $LASTEXITCODE
+
+          Write-Host "Descargando copia: $($rel.tagName)"
+          $ok = $false
+          for ($i = 1; $i -le 3 -and -not $ok; $i++) {
+              Get-ChildItem $dl -File -ErrorAction SilentlyContinue | Remove-Item -Force
+              gh release download $rel.tagName --dir $dl --clobber
+              if ($LASTEXITCODE -eq 0) { $ok = $true } else { Write-Host "Intento $i fallido"; Start-Sleep 10 }
+          }
+          if (-not $ok) {
+              Write-Host "::warning::No se pudo descargar la copia. Esta sesión NO guardará copias para no pisar la anterior."
+              $global:LASTEXITCODE = 0
+              exit 0
+          }
+
+          Get-ChildItem $dl -File | ForEach-Object {
+              Write-Host (" {0} {1} MB" -f $_.Name, [math]::Round($_.Length/1MB))
+         
